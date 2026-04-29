@@ -1,0 +1,38 @@
+[project]
+name = "ztf-archive-downloader"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+  "fastavro>=1.12.1",
+  "gitpython>=3.1.46",
+  "httpx>=0.28.1",
+  "humanize>=4.15.0",
+  "pyyaml>=6.0.3",
+  "socksio>=1.0.0",
+  "tqdm>=4.67.3",
+  "typer>=0.24.1",
+]
+
+[project.scripts]
+downloader = "ztf_archive_downloader.downloader:app"
+get_schemas = "ztf_archive_downloader.get_schemas:main"
+
+[dependency-groups]
+dev = [
+  "ipython>=9.12.0",
+  "polars>=1.39.3",
+  "pyright>=1.1.408",
+  "ruff>=0.15.11",
+]
+test = [
+  "pytest>=9.0.3",
+]
+
+[build-system]
+requires = ["uv_build>=0.9,<0.10"]
+build-backend = "uv_build"
+
+[tool.basedpyright]
+reportAny = false
