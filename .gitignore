@@ -6,3 +6,8 @@
 
 data/
 schemas/
+
+.vscode/
+*.code-workspace
+feeder_checkpoint.json
+/ztf_public_*.tar.gz
