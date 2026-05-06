@@ -5,6 +5,7 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
+  "confluent-kafka>=2.12.0,<3",
   "fastavro>=1.12.1",
   "gitpython>=3.1.46",
   "httpx>=0.28.1",
@@ -17,6 +18,7 @@ dependencies = [
 
 [project.scripts]
 downloader = "ztf_archive_downloader.downloader:app"
+feeder = "ztf_archive_downloader.feeder.cli:app"
 get_schemas = "ztf_archive_downloader.get_schemas:main"
 
 [dependency-groups]
