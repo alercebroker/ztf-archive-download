@@ -27,7 +27,7 @@ TOPIC = "ztf"
 SCHEMA_PATH = Path(
     os.environ.get(
         "FEEDER_SCHEMA_PATH",
-        "/home/ireyes/Projects/pipeline/schemas/ztf/alert.avsc",
+        str(Path(__file__).parent.parent.parent / "schemas" / "4.02" / "ztf.alert.alert.avsc"),
     )
 )
 

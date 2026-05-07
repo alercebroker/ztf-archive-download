@@ -9,9 +9,9 @@ from fastavro.validation import validate
 
 from ztf_archive_downloader.unify_schemas import convert_alert_to_latest
 
-LATEST_SCHEMA_PATH = Path("./schemas/4.02/ztf.alert.alert.avsc")
+LATEST_SCHEMA_PATH = Path(__file__).parent.parent / "schemas" / "4.02" / "ztf.alert.alert.avsc"
 LATEST_SCHEMA = load_schema(str(LATEST_SCHEMA_PATH))
-SAMPLES_DIR = Path("./data/unpacked/")
+SAMPLES_DIR = Path(__file__).parent / "avro_samples"
 
 
 def find_all_sample_avros() -> list[str]:

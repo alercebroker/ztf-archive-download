@@ -60,7 +60,7 @@ def main() -> None:
             out_dir = OUTPUT_BASE / version
             out_dir.mkdir(parents=True, exist_ok=True)
             for avsc_file in (tmppath / SCHEMA_DIR).glob("*.avsc"):
-                dest = out_dir / avsc_file.name
+                dest = out_dir / f"ztf.alert.{avsc_file.stem}.avsc"
                 if dest.exists():
                     logging.warning(f"Overwriting existing file: {dest}")
                 _ = shutil.copy2(avsc_file, dest)
