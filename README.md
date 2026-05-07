@@ -179,6 +179,11 @@ src/ztf_archive_downloader/
     iter_alerts.py   # Walk tar.gz files and yield converted alerts
     kafka_io.py      # Producer, lag computation, topic flush
     checkpoint.py    # Atomic JSON checkpoint for last-done day
+scripts/
+  redownload.sh      # Re-fetch corrupted/missing archive files in parallel
+  verify_checksums.sh # MD5-verify a directory of archive files
+docs/
+  feeder_plan.md     # Feeder design notes
 tests/
   avro_samples/      # Sample Avro files for testing (one per schema version)
   smoke/             # Integration smoke tests (requires Docker + Kafka)
