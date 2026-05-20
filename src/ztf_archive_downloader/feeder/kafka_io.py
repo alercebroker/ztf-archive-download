@@ -94,6 +94,8 @@ def compute_group_lag(
     group_id: str,
     topic: str,
     consumer_conf: dict[str, Any],
+    *,
+    probe: Consumer | None = None,
 ) -> int:
     meta = admin.list_topics(topic, timeout=10)
     if topic not in meta.topics:
@@ -105,7 +107,8 @@ def compute_group_lag(
     committed_tps = futures[group_id].result().topic_partitions
     committed = {tp.partition: tp.offset for tp in committed_tps}
 
-    tmp = Consumer({**consumer_conf, "group.id": "_feeder-lag-probe"})
+    own_consumer = probe is None
+    tmp = Consumer({**consumer_conf, "group.id": "_feeder-lag-probe"}) if own_consumer else probe
     total = 0
     try:
         for tp in tps:
@@ -114,7 +117,8 @@ def compute_group_lag(
             effective = c if c >= 0 else low
             total += max(0, high - effective)
     finally:
-        tmp.close()
+        if own_consumer:
+            tmp.close()
     return total
 
 
@@ -122,12 +126,15 @@ def count_topic_messages(
     admin: AdminClient,
     topic: str,
     consumer_conf: dict[str, Any],
+    *,
+    probe: Consumer | None = None,
 ) -> int:
     """Return the number of messages currently retained on the topic."""
     meta = admin.list_topics(topic, timeout=10)
     if topic not in meta.topics:
         return 0
-    tmp = Consumer({**consumer_conf, "group.id": "_feeder-msg-counter"})
+    own_consumer = probe is None
+    tmp = Consumer({**consumer_conf, "group.id": "_feeder-msg-counter"}) if own_consumer else probe
     total = 0
     try:
         for pid in meta.topics[topic].partitions:
@@ -135,7 +142,8 @@ def count_topic_messages(
             low, high = tmp.get_watermark_offsets(tp, timeout=5)
             total += max(0, high - low)
     finally:
-        tmp.close()
+        if own_consumer:
+            tmp.close()
     return total
 
 
@@ -167,45 +175,49 @@ def wait_until_drained(
     consecutive_zero: dict[tuple[str, str], int] = {gt: 0 for gt in group_topics}
     start = time.monotonic()
 
-    while True:
-        if shutdown_flag is not None and shutdown_flag.is_set():
-            raise RuntimeError("shutdown requested during drain")
+    probe = Consumer({**consumer_conf, "group.id": "_feeder-lag-probe"})
+    try:
+        while True:
+            if shutdown_flag is not None and shutdown_flag.is_set():
+                raise RuntimeError("shutdown requested during drain")
 
-        all_ok = True
-        elapsed = time.monotonic() - start
-        for g, t in group_topics:
-            lag = compute_group_lag(admin, g, t, consumer_conf)
-            key = (g, t)
-            if lag > 0:
-                saw_activity[key] = True
-                consecutive_zero[key] = 0
-                all_ok = False
-                logger.info("[drain] %s/%s  lag=%-8d  elapsed=%.0fs", g, t, lag, elapsed)
-                continue
-            # lag == 0: check whether the consumer has actually started
-            if not saw_activity[key]:
-                if _group_has_committed(admin, g, t, consumer_conf):
+            all_ok = True
+            elapsed = time.monotonic() - start
+            for g, t in group_topics:
+                lag = compute_group_lag(admin, g, t, consumer_conf, probe=probe)
+                key = (g, t)
+                if lag > 0:
                     saw_activity[key] = True
-                else:
+                    consecutive_zero[key] = 0
+                    all_ok = False
+                    logger.info("[drain] %s/%s  lag=%-8d  elapsed=%.0fs", g, t, lag, elapsed)
+                    continue
+                # lag == 0: check whether the consumer has actually started
+                if not saw_activity[key]:
+                    if _group_has_committed(admin, g, t, consumer_conf):
+                        saw_activity[key] = True
+                    else:
+                        all_ok = False
+                        logger.info(
+                            "[drain] %s/%s  lag=0  waiting for consumer to start  elapsed=%.0fs",
+                            g, t, elapsed,
+                        )
+                        continue
+                consecutive_zero[key] += 1
+                if consecutive_zero[key] < stable_checks:
                     all_ok = False
                     logger.info(
-                        "[drain] %s/%s  lag=0  waiting for consumer to start  elapsed=%.0fs",
-                        g, t, elapsed,
+                        "[drain] %s/%s  lag=0  stable %d/%d  elapsed=%.0fs",
+                        g, t, consecutive_zero[key], stable_checks, elapsed,
                     )
-                    continue
-            consecutive_zero[key] += 1
-            if consecutive_zero[key] < stable_checks:
-                all_ok = False
-                logger.info(
-                    "[drain] %s/%s  lag=0  stable %d/%d  elapsed=%.0fs",
-                    g, t, consecutive_zero[key], stable_checks, elapsed,
-                )
-            else:
-                logger.info("[drain] %s/%s  DRAINED after %.0fs", g, t, elapsed)
+                else:
+                    logger.info("[drain] %s/%s  DRAINED after %.0fs", g, t, elapsed)
 
-        if all_ok:
-            return
-        time.sleep(poll_s)
+            if all_ok:
+                return
+            time.sleep(poll_s)
+    finally:
+        probe.close()
 
 
 def check_flush_compatibility(admin: AdminClient, retention_flush_wait_s: float) -> None:
@@ -257,29 +269,32 @@ def flush_topic_via_retention(
     logger.info("flushing topic %s: retention.ms=%d bytes=%s", topic, flush_ms, flush_bytes)
     _apply(flush_pairs)
 
-    # Poll until the topic is actually empty or the timeout expires.
-    deadline = time.monotonic() + wait_s
-    poll_interval = 2.0
-    while True:
-        n = count_topic_messages(admin, topic, consumer_conf)
-        if n == 0:
-            logger.info("[flush] topic %s is empty — log cleaner done", topic)
-            break
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            logger.warning(
-                "[flush] topic %s still has %d messages after %.0fs — restoring retention anyway",
-                topic, n, wait_s,
-            )
-            break
-        logger.info("[flush] topic %s: %d messages remaining (%.0fs left)", topic, n, remaining)
-        time.sleep(min(poll_interval, remaining))
+    probe = Consumer({**consumer_conf, "group.id": "_feeder-msg-counter"})
+    try:
+        deadline = time.monotonic() + wait_s
+        poll_interval = 2.0
+        while True:
+            n = count_topic_messages(admin, topic, consumer_conf, probe=probe)
+            if n == 0:
+                logger.info("[flush] topic %s is empty — log cleaner done", topic)
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                logger.warning(
+                    "[flush] topic %s still has %d messages after %.0fs — restoring retention anyway",
+                    topic, n, wait_s,
+                )
+                break
+            logger.info("[flush] topic %s: %d messages remaining (%.0fs left)", topic, n, remaining)
+            time.sleep(min(poll_interval, remaining))
 
-    logger.info("restoring topic %s: retention.ms=%d bytes=%s", topic, restore_ms, restore_bytes)
-    _apply(restore_pairs)
+        logger.info("restoring topic %s: retention.ms=%d bytes=%s", topic, restore_ms, restore_bytes)
+        _apply(restore_pairs)
 
-    n = count_topic_messages(admin, topic, consumer_conf)
-    if n > 0:
-        logger.warning("[flush] topic %s has %d messages after retention restored — may repopulate", topic, n)
-    else:
-        logger.info("[flush] topic %s confirmed empty after retention restored", topic)
+        n = count_topic_messages(admin, topic, consumer_conf, probe=probe)
+        if n > 0:
+            logger.warning("[flush] topic %s has %d messages after retention restored — may repopulate", topic, n)
+        else:
+            logger.info("[flush] topic %s confirmed empty after retention restored", topic)
+    finally:
+        probe.close()

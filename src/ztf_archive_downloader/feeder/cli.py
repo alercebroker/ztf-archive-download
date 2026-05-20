@@ -60,6 +60,10 @@ def run(
         list[str],
         typer.Option("--pipeline-gate", envvar="FEEDER_PIPELINE_GATES", help="GROUP:TOPIC pairs (repeatable, ≥1 required). Drain gate = all pairs at lag=0 stable. Flush set = unique topics."),
     ] = [],
+    extra_flush_topic: Annotated[
+        list[str],
+        typer.Option("--extra-flush-topic", envvar="FEEDER_EXTRA_FLUSH_TOPICS", help="Additional topics to flush via retention after each batch (no drain gate required)."),
+    ] = [],
     batch_alert_threshold: Annotated[int, typer.Option("--batch-alert-threshold", envvar="FEEDER_BATCH_ALERT_THRESHOLD")] = 2_000_000,
     strip_cutouts: Annotated[bool, typer.Option("--strip-cutouts/--keep-cutouts", envvar="FEEDER_STRIP_CUTOUTS")] = False,
     start_day: Annotated[Optional[str], typer.Option("--start-day", envvar="FEEDER_START_DAY", help="YYYY-MM-DD inclusive")] = None,
@@ -80,7 +84,7 @@ def run(
     start_date = date.fromisoformat(start_day) if start_day else None
     end_date = date.fromisoformat(end_day) if end_day else None
     gates = _parse_pipeline_gates(pipeline_gate)
-    flush_topics = sorted({t for _, t in gates})
+    flush_topics = sorted({t for _, t in gates} | set(extra_flush_topic))
 
     schema = load_schema(str(schema_path))
 
