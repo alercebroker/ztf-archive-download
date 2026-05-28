@@ -7,6 +7,7 @@ import sys
 import tarfile
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
@@ -283,6 +284,14 @@ def download_one(
             envvar="ARCHIVE_DOWNLOAD_PROXY",
         ),
     ] = None,
+    yes: Annotated[
+        bool,
+        typer.Option(
+            "--yes",
+            "-y",
+            help="Skip confirmation prompt",
+        ),
+    ] = False,
 ) -> None:
     """
     Download a ZTF public alert file by date (YYYYMMDD) or full filename.
@@ -301,12 +310,12 @@ def download_one(
         last_modified, content_length = get_file_info(client, url)
         typer.echo(f"File: {filename}")
         typer.echo(f"Last-Modified: {last_modified}")
-        typer.echo(f"Size: {humanize.naturalsize(content_length)} bytes")
+        typer.echo(f"Size: {humanize.naturalsize(content_length)}")
 
-        confirm = typer.confirm("Download this file?")
-
-        if not confirm:
-            return
+        if not yes:
+            confirm = typer.confirm("Download this file?")
+            if not confirm:
+                return
 
         try:
             download_files_batch(
@@ -436,23 +445,84 @@ class FileReport(TypedDict):
     avro: list[AvroResult]
 
 
+def validate_single_file(
+    file_path: Path,
+    checksums: dict[str, str],
+    skip_on_md5_fail: bool,
+) -> tuple[str, FileReport]:
+    md5_result: MD5Result = {
+        "status": Status.NOT_FOUND,
+        "expected": None,
+        "got": None,
+        "error": None,
+    }
+    extract_result: ExtractResult | None = None
+    avro_results: list[AvroResult] = []
+
+    has_checksum = file_path.name in checksums
+
+    if not has_checksum and skip_on_md5_fail:
+        return file_path.name, {"md5": md5_result, "extract": None, "avro": []}
+
+    if has_checksum:
+        try:
+            md5 = hashlib.md5()
+            with open(file_path, "rb") as f:
+                for chunk in iter(lambda: f.read(1 << 20), b""):
+                    md5.update(chunk)
+            file_md5 = md5.hexdigest()
+            if file_md5 == checksums[file_path.name]:
+                md5_result["status"] = Status.OK
+            else:
+                md5_result["status"] = Status.INVALID
+                md5_result["expected"] = checksums[file_path.name]
+                md5_result["got"] = file_md5
+        except Exception as exc:
+            md5_result["status"] = Status.ERROR
+            md5_result["error"] = str(exc)
+
+    if md5_result["status"] in (Status.OK, Status.NOT_FOUND) or not skip_on_md5_fail:
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                with tarfile.open(file_path, "r:gz") as tar:
+                    tar.extractall(path=tmpdir, filter="data")
+                extract_result = {"status": Status.OK, "error": None}
+                for avro_file in Path(tmpdir).rglob("*.avro"):
+                    avro_entry: AvroResult = {
+                        "file": avro_file.name,
+                        "status": Status.OK,
+                        "error": None,
+                    }
+                    try:
+                        with open(avro_file, "rb") as af:
+                            _ = list(avro_reader(af))
+                    except Exception as exc:
+                        avro_entry["status"] = Status.ERROR
+                        avro_entry["error"] = str(exc)
+                    avro_results.append(avro_entry)
+        except Exception as exc:
+            extract_result = {"status": Status.ERROR, "error": str(exc)}
+
+    return file_path.name, {
+        "md5": md5_result,
+        "extract": extract_result,
+        "avro": avro_results,
+    }
+
+
 @app.command()
 def validate(
+    files: Annotated[
+        list[Path] | None,
+        typer.Argument(help="Files to validate (reads from stdin if piped)"),
+    ] = None,
     output_dir: Annotated[
         Path | None,
         typer.Option(
             "--output-dir",
             "-d",
-            help="Directory containing downloaded files to validate (full check)",
+            help="Directory containing downloaded files to validate",
             envvar="ARCHIVE_DOWNLOAD_DIR",
-        ),
-    ] = None,
-    file: Annotated[
-        Path | None,
-        typer.Option(
-            "--file",
-            "-f",
-            help="Validate a single .tar.gz file instead of a directory",
         ),
     ] = None,
     proxy: Annotated[
@@ -474,104 +544,92 @@ def validate(
             case_sensitive=False,
         ),
     ] = OutputFormat.HUMAN,
-    ignore_md5_check: Annotated[
+    skip_on_md5_fail: Annotated[
         bool,
         typer.Option(
-            "--ignore-md5-check/--no-ignore-md5-check",
+            "--skip-on-md5-fail/--no-skip-on-md5-fail",
             "-x",
-            help="Skip MD5 check and validate extraction/Avro only",
+            help="Skip extraction and Avro validation when MD5 check fails",
         ),
-    ] = True,
+    ] = False,
+    workers: Annotated[
+        int,
+        typer.Option(
+            "--workers",
+            "-w",
+            help="Number of parallel validation workers",
+        ),
+    ] = 4,
 ) -> None:
     """
-    Validate downloaded files in the output directory against the MD5SUMS archive, check extraction, and validate Avro files.
-    Prints a detailed report to stdout or as JSON/YAML.
+    Validate .tar.gz files against MD5SUMS, check extraction, and validate Avro contents.
+
+    Accepts file paths as positional arguments, from stdin (one per line),
+    or validates all .tar.gz in --output-dir.
     """
-    if (output_dir is None and file is None) or (output_dir and file):
-        typer.echo("You must specify either --output-dir or --file, but not both.")
+    files_to_check: list[Path] = []
+
+    if files:
+        files_to_check = files
+    elif not sys.stdin.isatty():
+        for line in sys.stdin:
+            stripped = line.strip()
+            if stripped:
+                files_to_check.append(Path(stripped))
+
+    if not files_to_check and output_dir is not None:
+        files_to_check = list(output_dir.glob("*.tar.gz"))
+
+    if not files_to_check:
+        typer.echo("Provide files as arguments, via stdin, or use --output-dir.")
         raise typer.Exit(code=1)
 
     with httpx.Client(proxy=proxy or None) as client:
         checksums = get_all_filenames_with_checksums(client)
 
     reports: dict[str, FileReport] = {}
-    files_to_check: list[Path] = []
-    if file is not None:
-        files_to_check = [file]
-    elif output_dir is not None:
-        files_to_check = list(output_dir.glob("*.tar.gz"))
+    use_tqdm = sys.stderr.isatty() and len(files_to_check) > 1
 
-    use_tqdm = sys.stdout.isatty() and len(files_to_check) > 1
-    iterator = (
-        tqdm(files_to_check, desc="Validating", unit="file")
-        if use_tqdm
-        else files_to_check
-    )
+    if workers <= 1 or len(files_to_check) == 1:
+        iterator = (
+            tqdm(files_to_check, desc="Validating", unit="file", file=sys.stderr)
+            if use_tqdm
+            else files_to_check
+        )
+        for fp in iterator:
+            name, report = validate_single_file(fp, checksums, skip_on_md5_fail)
+            reports[name] = report
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {
+                pool.submit(
+                    validate_single_file, fp, checksums, skip_on_md5_fail
+                ): fp
+                for fp in files_to_check
+            }
+            with tqdm(
+                total=len(futures),
+                desc="Validating",
+                unit="file",
+                file=sys.stderr,
+                disable=not use_tqdm,
+            ) as pbar:
+                for future in as_completed(futures):
+                    name, report = future.result()
+                    reports[name] = report
+                    pbar.update(1)
 
-    for file in iterator:
-        md5_result: MD5Result = {
-            "status": Status.NOT_FOUND,
-            "expected": None,
-            "got": None,
-            "error": None,
-        }
-        extract_result: ExtractResult | None = None
-        avro_results: list[AvroResult] = []
-
-        if file.name not in checksums:
-            reports[file.name] = {"md5": md5_result, "extract": None, "avro": []}
-            if not ignore_md5_check:
-                continue
-
-        try:
-            md5 = hashlib.md5()
-            with open(file, "rb") as f:
-                for chunk in iter(lambda: f.read(8192), b""):
-                    md5.update(chunk)
-            file_md5 = md5.hexdigest()
-            if file_md5 == checksums[file.name]:
-                md5_result["status"] = Status.OK
-            else:
-                md5_result["status"] = Status.INVALID
-                md5_result["expected"] = checksums[file.name]
-                md5_result["got"] = file_md5
-        except Exception as exc:
-            md5_result["status"] = Status.ERROR
-            md5_result["error"] = str(exc)
-
-        if md5_result["status"] == Status.OK or ignore_md5_check:
-            try:
-                with tempfile.TemporaryDirectory() as tmpdir:
-                    with tarfile.open(file, "r:gz") as tar:
-                        tar.extractall(path=tmpdir)
-                    extract_result = {"status": Status.OK, "error": None}
-                    for avro_file in Path(tmpdir).rglob("*.avro"):
-                        avro_entry: AvroResult = {
-                            "file": avro_file.name,
-                            "status": Status.OK,
-                            "error": None,
-                        }
-                        try:
-                            with open(avro_file, "rb") as af:
-                                _ = list(avro_reader(af))
-                        except Exception as exc:
-                            avro_entry["status"] = Status.ERROR
-                            avro_entry["error"] = str(exc)
-                        avro_results.append(avro_entry)
-            except Exception as exc:
-                extract_result = {"status": Status.ERROR, "error": str(exc)}
-        reports[file.name] = {
-            "md5": md5_result,
-            "extract": extract_result,
-            "avro": avro_results,
-        }
+    ordered: dict[str, FileReport] = {}
+    for fp in files_to_check:
+        if fp.name in reports:
+            ordered[fp.name] = reports[fp.name]
+    reports = ordered
 
     if output_format == OutputFormat.JSON:
         typer.echo(json.dumps(reports, indent=2, default=str))
     elif output_format == OutputFormat.YAML:
         typer.echo(yaml.dump(reports, sort_keys=False, default_flow_style=False))
     else:
-        # Human-readable
         report_lines: list[str] = []
         for fname, status in reports.items():
             report_lines.append(f"File: {fname}")

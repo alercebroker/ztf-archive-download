@@ -39,6 +39,7 @@
             uv
             basedpyright
             hyperfine
+            duckdb
           ];
 
           # UV
